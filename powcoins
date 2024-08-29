@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+# Copyright (c) 2015-2024 The Bitcoin Core developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or http://www.opensource.org/licenses/mit-license.php.
+"""Test (OP_CAT)
+"""
+
+import argparse
+import json
+import logging
+import math
+import os
+import socket
+import subprocess
+import sys
+import time
+
+from verystable.core.messages import (
+    CInv,
+    COutPoint,
+    CTransaction,
+    CTxIn,
+    CTxInWitness,
+    CTxOut,
+    MSG_TX,
+    hash256,
+    msg_inv,
+    msg_tx,
+    tx_from_hex,
+)
+from verystable.core.p2p import P2PInterface, NetworkThread, MAGIC_BYTES
+from verystable.core.script import (
+    SIGHASH_DEFAULT,
+    TaprootSignatureHash,
+    taproot_construct,
+)
+from verystable.core.key import ECKey, compute_xonly_pubkey, sign_schnorr
+from verystable.core.address import address_to_scriptpubkey
+
+if False:
+    """PoW-limited faucet using OP_CAT (idea by ajtowns, see
+       https://twitter.com/ajtowns/status/1785842090607591712,
+       https://github.com/theStack/bitcoin-inquisition/issues/1#issue-2282650357 and
+       https://github.com/theStack/bitcoin-inquisition/issues/1#issuecomment-2102898015).
+
+       To spend a fauCAT output, provide a signature S together with
+       a nonce S, such that sha256(N || S) ends with a certain count of
+       zero-bits (the "difficulty" D). The non-zero-bytes part of the
+       PoW-hash has to be provided in two (core part HA, last non-zero byte HB).
+
+       Witness stack for spending:
+            - P (x-only public key [32 bytes])
+            - S (signature [64 bytes, i.e. implicit SIGHASH_ALL])
+            - N (nonce string)
+            - HA (core part of hash)
+            - HB (last non-zero byte of hash)
+            - D (difficulty, number of trailing zero-bits [CScriptNum in range 0-63])
+    """
+
+#### aspects
+# 1. get the script + address
+#    (maybe parameterised by min/max difficulty, delay, internal pubkey)
+# 2. setup an rpcwallet to track address
+# 3. get the best unspent utxo to work on
+# 4. generate a signature, given where you want the funds to go to
+# 5. generate a pow job based on the signature
+# 6. generate (and submit) a valid tx given the utxo, signature and pow
+
+# fields are:
+#  * number of blocks before difficulty drops
+#  * min difficulty
+#  * max difficulty
+#  * script
+SCRIPTS = [
+  (10, 16, 80, 360, bytes.fromhex("60947600a2697601409f697676937676937693930280027c94b2750200006b760120a2636c04000000007e6b012094687660a2636c0200007e6b6094687658a2636c01007e6b5894687c825188766b517e020001947c7600876302000167765187630280006776528763014067765387630120677654876360677655876358677656876354675268686868686868779f696c6c7e7e6b708201208875820140887c827c7e7e7c827c7e7c7eaa6c88ac")),
+  (4, 16, 80, 356, bytes.fromhex("60947600a2697601409f6976769376930200017c94b2750200006b760120a2636c04000000007e6b012094687660a2636c0200007e6b6094687658a2636c01007e6b5894687c825188766b517e020001947c7600876302000167765187630280006776528763014067765387630120677654876360677655876358677656876354675268686868686868779f696c6c7e7e6b708201208875820140887c827c7e7e7c827c7e7c7eaa6c88ac")),
+  (1, 16, 80, 351, bytes.fromhex("60947600a2697601409f697601407c94b2750200006b760120a2636c04000000007e6b012094687660a2636c0200007e6b6094687658a2636c01007e6b5894687c825188766b517e020001947c7600876302000167765187630280006776528763014067765387630120677654876360677655876358677656876354675268686868686868779f696c6c7e7e6b708201208875820140887c827c7e7e7c827c7e7c7eaa6c88ac")),
+]
+ipk = bytes.fromhex("4a981eda2acd9bf5d789fa1a9b7f95677776d99fd13ec0f658f0e4dbc5b5c878")
+
+def get_tapinfo(args):
+    tapinfo = {}
+    for dropdiff, mindiff, maxdiff, extraweight, script in SCRIPTS:
+        ti = taproot_construct(ipk, [("only-path", script)])
+        spk = ti.scriptPubKey.hex()
+        faucet_addr = json.loads(args.bcli("decodescript", spk)).get("address", None)
+        if faucet_addr is None:
+            logging.error(f"Faucet address for delay {dropdiff} is unknown?? (spk={spk})")
+            return 1
+        logging.debug(f"Faucet address {faucet_addr} (delay={dropdiff})")
+
+        if spk in tapinfo:
+            logging.error(f"Duplicate faucet address for delays {tapinfo[spk][0]} and {dropdiff}")
+            return 1
+        tapinfo[spk] = (dropdiff, mindiff, maxdiff, extraweight, script, ti, faucet_addr)
+    return tapinfo
+
+def do_setupwallet(args):
+    tapinfo = get_tapinfo(args)
+    args.bcli("-named", "createwallet", f"wallet_name={args.wallet}", "disable_private_keys=true", "descriptors=true", "load_on_startup=true")
+
+    descinfo = []
+    for spk, (n, mindiff, maxdiff, extraweight, script, ti, addr) in tapinfo.items():
+        desc = json.loads(args.bcli("getdescriptorinfo", f"addr({addr})")).get("descriptor")
+        descinfo.append(dict(desc=desc, timestamp=int(time.time() - 600*128*n)))
+    args.bcli(f"-rpcwallet={args.wallet}", "importdescriptors", json.dumps(descinfo))
+    return 0
+
+def sendtx(args, tx):
+    if args.relay_peer is not None:
+        if ":" in args.relay_peer:
+            host, port = args.relay_peer.split(":", 1)
+            port = int(port)
+        else:
+            host, port = args.relay_peer, 38333
+        ipaddr = socket.gethostbyname(host)
+
+        tx.rehash()
+        txid = tx.sha256
+
+        network_thread = NetworkThread()
+        network_thread.start()
+        peer = P2PInterface(wtxidrelay=False)
+        peer.p2p_connected_to_node = True
+        peer.peer_connect(dstaddr=ipaddr, dstport=port, send_version=True, net="signet", timeout_factor=1)()
+        peer.wait_until(lambda: peer.is_connected, check_connected=False)
+        peer.wait_for_verack()
+        peer.sync_with_ping()
+        peer.send_message(msg_inv([CInv(t=MSG_TX, h=txid)]))
+        peer.wait_for_getdata([txid])
+        peer.send_and_ping(msg_tx(tx))
+        network_thread.close()
+        logging.info(f"relayed txid {tx.hash}")
+    else:
+        r = args.bcli("sendrawtransaction", tx.serialize().hex())
+        logging.info(f"sendrawtransaction result {r}")
+
+def do_claim(args):
+    payto = address_to_scriptpubkey(args.address)
+
+    tapinfo = get_tapinfo(args)
+
+    coins = json.loads(args.bcli(f"-rpcwallet={args.wallet}", "listunspent"))
+
+    scored = []
+    found = False
+    easiest = 99
+    for c in coins:
+        if c["scriptPubKey"] not in tapinfo: continue # don't know how to spend
+        d, mindiff, maxdiff, extraweight, script, ti, _ = tapinfo[c["scriptPubKey"]]
+        found = True
+        conf = c["confirmations"]//d
+        diff = max(maxdiff - conf, mindiff)
+        easiest = min(diff, easiest)
+        if diff > args.max_difficulty: continue # too difficult
+        score = math.log(c["amount"], 2) - diff
+        scored.append((score, c["confirmations"], c["txid"], c["vout"], c, d, mindiff, maxdiff, extraweight, script, ti))
+    if not found:
+        logging.error("Faucet is empty")
+        return 1
+    elif not scored:
+        logging.error(f"Faucet is too difficult (min difficulty {easiest})")
+        return 1
+    scored = sorted(scored)
+
+    # best one!
+    score, conf, txid, vout, c, delay, mindiff, maxdiff, extraweight, script, tapinfo = scored[-1]
+    amount = int(c["amount"]*1e8)
+    difficulty = max(mindiff, maxdiff - conf//delay)
+    invdiff = maxdiff - difficulty
+    csv = invdiff * delay
+    assert conf >= csv >= 0
+
+    if c["scriptPubKey"] != tapinfo.scriptPubKey.hex():
+        logging.error("Best coin in wallet has wrong scriptPubKey (%s != %s)" % (c["scriptPubKey"], tapinfo.scriptPubKey.hex()))
+        return 1
+
+    # claim coin
+    claim_tx = CTransaction()
+    claim_tx.vin = [CTxIn(COutPoint(int(txid, 16), vout), nSequence=csv)]
+    claim_tx.wit.vtxinwit = [CTxInWitness()]
+    claim_tx.vout = [CTxOut(amount, payto)]
+    weight_before = claim_tx.get_weight()
+
+    fee = 10000
+    feerate = 42.42
+    dust = 10000
+    fee = math.ceil((weight_before + extraweight)/4 * feerate)
+    if amount - fee < dust:
+        logging.error("Fee too large ({fee} sats), failing")
+        return 1
+    claim_tx.vout[0].nValue -= fee
+
+    privkey = ECKey()
+    privkey.set(int(1).to_bytes(32, 'big'), compressed=True)
+    pubkey, _ = compute_xonly_pubkey(privkey.get_bytes())
+    signature_hash = TaprootSignatureHash(claim_tx, [CTxOut(amount, tapinfo.scriptPubKey)], SIGHASH_DEFAULT, 0, True, script)
+    signature = sign_schnorr(privkey.get_bytes(), signature_hash)
+
+    prefix = b'\x03\x00\x00\x00'
+    nbits = bytes(reversed([(280 - difficulty)//8, 0, 0, (1 << ((280 - difficulty) % 8))]))
+    logging.debug(f"nbits = {nbits.hex()} difficulty = {difficulty} csv = {csv} invdiff = {invdiff} delay = {delay}")
+    time = b'\x0b\x00\x00\x00'
+
+    fake_header = prefix + signature + time + nbits + b'\x00\x00\x00\x00'
+    logging.debug(f"GRIND {fake_header.hex()}")
+    grind = subprocess.run(args.grind.split(" ") + [fake_header.hex()], stdout=subprocess.PIPE, input=b"", check=True).stdout.strip().decode('utf8')
+    logging.debug(f"GROUND {grind}")
+
+    grind = bytes.fromhex(grind)
+    if grind[0] != 3 or grind[68] != 11 or grind[4:68] != signature or len(grind) != 80:
+        logging.error("grind command changed too much")
+        return 1
+
+    prefix = grind[1:4]
+    suffix = grind[69:]
+
+    hashed = hash256(grind)
+    n = 32 - difficulty//8 - 1
+    h_a, h_b = bytes([hashed[n]]), hashed[:n]
+
+    claim_tx.wit.vtxinwit[0].scriptWitness.stack = [
+        signature, pubkey,
+        prefix, suffix, h_b, h_a, bytes([difficulty]),
+        script,
+        bytes([0xc0 + tapinfo.negflag]) + ipk
+    ]
+    weight_after = claim_tx.get_weight()
+    # assert weight_after == weight_before + extraweight + difficulty//8
+    logging.debug(f"extra weight for {tapinfo.scriptPubKey.hex()}: {weight_after - weight_before} = {weight_after} - {weight_before} (expected {extraweight})")
+    logging.debug(f"tx {claim_tx.serialize().hex()}")
+    sendtx(args, claim_tx)
+    return 0
+
+def bitcoin_cli(basecmd, args, **kwargs):
+    cmd = basecmd + args
+    logging.debug("Calling bitcoin-cli: %r", cmd)
+    out = subprocess.run(cmd, stdout=subprocess.PIPE, **kwargs, check=True).stdout
+    if isinstance(out, bytes):
+        out = out.decode('utf8')
+    return out.strip()
+
+def main(argv):
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--debug", action="store_true", help="Print debugging info")
+    parser.add_argument("--quiet", action="store_true", help="Only print warnings/errors")
+
+    cmds = parser.add_subparsers(help="sub-commands")
+
+    claim = cmds.add_parser("claim", help="Claim funds from PoW faucet")
+    claim.set_defaults(fn=do_claim)
+    claim.add_argument("--wallet", default="powcoins", help="Name of wallet used for tracking faucet coins")
+    claim.add_argument("--cli", default="bitcoin-cli -signet", help="Command line for bitcoin-cli")
+    claim.add_argument("--relay-peer", default=None, type=str, help="Peer accepting OP_CAT txs for relay")
+    claim.add_argument("--grind", default="bitcoin-util grind", help="Command line for grinding a header")
+    claim.add_argument("--max-difficulty", default=26, type=int, help="Maximum difficulty to attempt")
+    claim.add_argument("address", help="Address to receive funds")
+
+    setupwallet = cmds.add_parser("setup-wallet", help="Setup wallet to track PoW faucet")
+    setupwallet.set_defaults(fn=do_setupwallet)
+    setupwallet.add_argument("--wallet", default="powcoins", help="Name of wallet used for tracking faucet coins")
+    setupwallet.add_argument("--cli", default="bitcoin-cli -signet", help="Command line for bitcoin-cli")
+
+    args = parser.parse_args(argv)
+
+    args.bcli = lambda *a, input=b"", **kwargs: bitcoin_cli(args.cli.split(" "), list(a), input=input, **kwargs)
+
+    if args.debug and args.quiet:
+        logging.error("Can only specify one of --debug and --quiet")
+        return 1
+    elif args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    elif args.quiet:
+        logging.getLogger().setLevel(logging.WARNING)
+    else:
+        logging.getLogger().setLevel(logging.INFO)
+
+    if hasattr(args, "fn"):
+        return args.fn(args)
+    else:
+        logging.error("Must specify command")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
