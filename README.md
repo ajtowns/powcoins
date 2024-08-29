@@ -31,6 +31,9 @@ called "powcoins") to track these coins by running:
 $ ./powcoins setup-wallet
 ```
 
+If `bitcoin-cli` is not in your `PATH`, you can specify how it should
+be invoked by adding the `--cli="bitcoin-cli -signet"` option.
+
 Note that this requires scanning through recent blocks for available
 coins, so takes a little time.
 
@@ -41,17 +44,16 @@ a command like:
 $ ./powcoins claim --relay-peer=inquisition.bitcoin-signet.net --max-diff=30 $ADDR
 ```
 
-If your local Bitcoin signet node is running the Inquisition code and
-accepts `OP_CAT` spends, then you can remove the `--relay-peer` argument
-to have your transaction submitted locally, and relayed in the usual
-manner instead.
+If your local Bitcoin signet node is running the Inquisition code
+and accepts `OP_CAT` spends, then you can remove the `--relay-peer`
+argument to have your transaction submitted locally via `bitcoin-cli`,
+and relayed in the usual manner instead.
 
-If `bitcoin-cli` and `bitcoin-util` are not in your `PATH`, you can
-specify how they should be invoked by adding the `--cli="bitcoin-cli
--signet"` and `--grind="bitcoin-util grind"` options.
+Depending on your `PATH`, it may be necessary to set `--cli` as above,
+and also to specify the location of the `bitcoin-util` command with the
+`--grind="bitcoin-util grind"` option.
 
-Because "bitcoin-util grind" is a CPU miner, the "max-diff" figure is
-provided to avoid wasting energy if the only available coins are very
+Because `bitcoin-util grind` is a CPU miner, the `--max-diff` figure is
+provided to avoid wasting energy if the only available coins have high
 difficulty. Each increment of max-diff (eg changing 30 to 31) will double
 the amount of work it may take to obtain a coin.
-
