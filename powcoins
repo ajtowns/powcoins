@@ -136,6 +136,13 @@ def sendtx(args, tx):
         logging.info(f"sendrawtransaction result {r}")
 
 def do_claim(args):
+    feerate = int(args.feerate)
+    if feerate >= 10000:
+        logging.warning("Extremely high feerate specified (%s sats/vb), continuing anyway" % (feerate,))
+    elif feerate < 1:
+        logging.error("Feerate too low, must be at least 1")
+        return 1
+
     payto = address_to_scriptpubkey(args.address)
 
     tapinfo = get_tapinfo(args)
@@ -182,12 +189,10 @@ def do_claim(args):
     claim_tx.vout = [CTxOut(amount, payto)]
     weight_before = claim_tx.get_weight()
 
-    fee = 10000
-    feerate = 42.42
     dust = 10000
     fee = math.ceil((weight_before + extraweight)/4 * feerate)
     if amount - fee < dust:
-        logging.error("Fee too large ({fee} sats), failing")
+        logging.error("Fee too large ({fee} sats), remaining amount too small, failing")
         return 1
     claim_tx.vout[0].nValue -= fee
 
@@ -255,6 +260,7 @@ def main(argv):
     claim.add_argument("--relay-peer", default=None, type=str, help="Peer accepting OP_CAT txs for relay")
     claim.add_argument("--grind", default="bitcoin-util grind", help="Command line for grinding a header")
     claim.add_argument("--max-difficulty", default=26, type=int, help="Maximum difficulty to attempt")
+    claim.add_argument("--feerate", default=5, type=int, help="Feerate to use (sats/vb)")
     claim.add_argument("address", help="Address to receive funds")
 
     setupwallet = cmds.add_parser("setup-wallet", help="Setup wallet to track PoW faucet")
