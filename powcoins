@@ -234,6 +234,7 @@ def do_claim(args):
     # assert weight_after == weight_before + extraweight + difficulty//8
     logging.debug(f"extra weight for {tapinfo.scriptPubKey.hex()}: {weight_after - weight_before} = {weight_after} - {weight_before} (expected {extraweight})")
     logging.debug(f"tx {claim_tx.serialize().hex()}")
+    args.bcli(f"-rpcwallet={args.wallet}", "lockunspent", 'false', json.dumps([dict(txid=txid, vout=vout)]))
     sendtx(args, claim_tx)
     return 0
 
