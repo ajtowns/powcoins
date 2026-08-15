@@ -7,6 +7,7 @@
 import argparse
 import base64
 import collections
+import concurrent.futures
 import dataclasses
 from decimal import Decimal
 import functools
@@ -306,20 +307,20 @@ def do_setupwallet(args):
     args.bcli(f"-rpcwallet={args.wallet}", "importdescriptors", json.dumps(descinfo))
     return 0
 
-def sendtx(args, tx):
-    if args.relay_peer is not None:
-        if ":" in args.relay_peer:
-            host, port = args.relay_peer.split(":", 1)
-            port = int(port)
-        else:
-            host, port = args.relay_peer, 38333
-        ipaddr = socket.gethostbyname(host)
+def _relay_via_p2p(args, tx):
+    if ":" in args.relay_peer:
+        host, port = args.relay_peer.split(":", 1)
+        port = int(port)
+    else:
+        host, port = args.relay_peer, 38333
+    ipaddr = socket.gethostbyname(host)
 
-        tx.rehash()
-        txid = tx.sha256
+    tx.rehash()
+    txid = tx.sha256
 
-        network_thread = NetworkThread()
-        network_thread.start()
+    network_thread = NetworkThread()
+    network_thread.start()
+    try:
         peer = P2PInterface(wtxidrelay=False)
         peer.p2p_connected_to_node = True
         peer.peer_connect(dstaddr=ipaddr, dstport=port, send_version=True, net="signet", timeout_factor=1)()
@@ -329,11 +330,27 @@ def sendtx(args, tx):
         peer.send_message(msg_inv([CInv(t=MSG_TX, h=txid)]))
         peer.wait_for_getdata([txid])
         peer.send_and_ping(msg_tx(tx))
+    finally:
         network_thread.close()
-        logging.info(f"relayed txid {tx.hash}")
+    logging.info(f"relayed txid {tx.hash}")
+    return tx.hash
+
+def sendtx(args, tx, retries=3, backoff=5):
+    if args.relay_peer is not None:
+        last_exc = None
+        for attempt in range(1, retries + 1):
+            try:
+                return _relay_via_p2p(args, tx)
+            except Exception as e:
+                last_exc = e
+                logging.warning(f"P2P relay attempt {attempt}/{retries} failed: {e}")
+                if attempt < retries:
+                    time.sleep(backoff)
+        raise last_exc
     else:
         r = args.bcli("sendrawtransaction", tx.serialize().hex())
         logging.info(f"sendrawtransaction result {r}")
+        return r
 
 def do_claim(args):
     if args.feerate is None:
@@ -351,11 +368,8 @@ def do_claim(args):
         return 1
 
     payto = address_to_scriptpubkey(args.address)
-
     tapinfo = get_tapinfo(args)
-
     coins = json.loads(args.bcli(f"-rpcwallet={args.wallet}", "listunspent"))
-
     future = getattr(args, 'future', 0) or 0
     metas = coins_meta(tapinfo, coins, future)
     if not metas:
@@ -366,17 +380,94 @@ def do_claim(args):
         logging.error(f"Faucet is too difficult (min difficulty {easiest})")
         return 1
 
-    _, best = max((c.logsats - c.difficulty + random.random(), c) for c in metas if c.difficulty <= args.max_difficulty)
+    parallel = getattr(args, 'parallel', 1) or 1
+    pin = getattr(args, 'utxo', None)
 
+    if parallel > 1:
+        if pin:
+            logging.error("--utxo and --parallel are mutually exclusive")
+            return 1
+        candidates_by_key = {}
+        for c in metas:
+            if c.difficulty > args.max_difficulty:
+                continue
+            candidates_by_key[(c.txid, c.vout)] = c
+        candidates = sorted(candidates_by_key.values(), key=lambda c: (c.difficulty, -c.logsats))[:parallel]
+        if not candidates:
+            logging.error(f"No coins available at or below --max-difficulty {args.max_difficulty}")
+            return 1
+        print(f"Racing {len(candidates)} distinct coins in parallel against {args.address}...")
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(candidates)) as ex:
+            futures = {ex.submit(_claim_one_coin, args, c, payto, feerate, future): c for c in candidates}
+            for fut in concurrent.futures.as_completed(futures):
+                c = futures[fut]
+                try:
+                    r = fut.result()
+                except Exception as e:
+                    r = dict(ok=False, error=str(e), input_txid=c.txid, input_vout=c.vout, log=[])
+                results.append(r)
+                tag = f"{c.txid}:{c.vout} (d={c.difficulty})"
+                if r["ok"]:
+                    print(f"[{tag}] relayed txid {r['txid']}")
+                else:
+                    print(f"[{tag}] FAILED: {r.get('error')}")
+        relayed = [r for r in results if r["ok"]]
+        print(f"\n{len(relayed)}/{len(candidates)} relayed successfully")
+        if not future:
+            wait_seconds = getattr(args, 'wait_confirm', 900) or 0
+            _wait_for_confirmation(args, relayed, wait_seconds)
+        return 0 if relayed else 1
+
+    best = _select_coin(metas, args, pin)
+    if best is None:
+        return 1
+    result = _claim_one_coin(args, best, payto, feerate, future)
+    for line in result["log"]:
+        print(line)
+    if not result["ok"]:
+        return 1
+    return 0
+
+def _select_coin(metas, args, pin=None):
+    """Pick the coin to claim: a pinned txid:vout, or the highest-scoring one."""
+    if pin:
+        pin_txid, pin_vout = pin.split(":")
+        pin_vout = int(pin_vout)
+        matches = [c for c in metas if c.txid == pin_txid and c.vout == pin_vout]
+        if not matches:
+            logging.error(f"--utxo {pin} not found among spendable faucet coins")
+            return None
+        best = matches[0]
+        if best.difficulty > args.max_difficulty:
+            logging.error(f"--utxo {pin} requires difficulty {best.difficulty} > --max-difficulty {args.max_difficulty}")
+            return None
+        return best
+    _, best = max((c.logsats - c.difficulty + random.random(), c) for c in metas if c.difficulty <= args.max_difficulty)
+    return best
+
+def _claim_one_coin(args, best, payto, feerate, future=0):
+    """Build, sign, grind, and (unless future) relay a claim tx for one specific coin.
+
+    Returns a dict: ok, txid (local==relayed, since sendtx returns the same hash
+    the node computed), input_txid, input_vout, error, tx_hex, log (list of lines).
+    Never prints directly, so callers can run many of these concurrently without
+    interleaving output.
+    """
+    log = []
+    input_txid, input_vout = best.txid, best.vout
     amount = btc_to_sats(best.coin["amount"])
     d = best.difficulty
     invdiff = best.maxdiff - d
     csv = invdiff * best.delay
     assert best.conf >= csv >= 0
 
+    def fail(msg):
+        logging.error(msg)
+        return dict(ok=False, error=msg, input_txid=input_txid, input_vout=input_vout, log=log)
+
     if best.coin["scriptPubKey"] != best.tapinfo.scriptPubKey.hex():
-        logging.error("Best coin in wallet has wrong scriptPubKey (%s != %s)" % (best.coin["scriptPubKey"], best.tapinfo.scriptPubKey.hex()))
-        return 1
+        return fail("Best coin in wallet has wrong scriptPubKey (%s != %s)" % (best.coin["scriptPubKey"], best.tapinfo.scriptPubKey.hex()))
 
     # claim coin
     claim_tx = CTransaction()
@@ -389,8 +480,7 @@ def do_claim(args):
     extraweight = witness_weight(best.script, d, variant=best.variant)
     fee = math.ceil((weight_before + extraweight)/4 * feerate)
     if amount - fee < dust:
-        logging.error("Fee too large ({fee} sats), remaining amount too small, failing")
-        return 1
+        return fail(f"Fee too large ({fee} sats), remaining amount too small, failing")
     claim_tx.vout[0].nValue -= fee
 
     signature_hash = TaprootSignatureHash(claim_tx, [CTxOut(amount, best.tapinfo.scriptPubKey)], SIGHASH_DEFAULT, 0, True, best.script)
@@ -422,14 +512,12 @@ def do_claim(args):
     grind = bytes.fromhex(grind)
     if best.variant == 'legacy':
         if grind[0] != 3 or grind[68] != 11 or grind[4:68] != signature or len(grind) != 80:
-            logging.error("grind command changed too much")
-            return 1
+            return fail("grind command changed too much")
         hdr_prefix = grind[1:4]
         hdr_suffix = grind[69:]
     elif best.variant == 'stratum_a':
         if grind[4:36] != prevhash or grind[36:68] != merkle_root or len(grind) != 80:
-            logging.error("grind command changed too much")
-            return 1
+            return fail("grind command changed too much")
         hdr_prefix = grind[0:4]
         hdr_suffix = grind[68:]
     else:
@@ -458,20 +546,121 @@ def do_claim(args):
     weight_after = claim_tx.get_weight()
     logging.debug(f"witness weight for {best.tapinfo.scriptPubKey.hex()}: {weight_after - weight_before} (estimated {extraweight})")
     logging.debug(f"tx {claim_tx.serialize().hex()}")
+
+    claim_tx.rehash()
+    local_txid = claim_tx.hash
+    tx_hex = claim_tx.serialize().hex()
+
     if future:
-        claim_tx.rehash()
-        print(f"d: {d} ({_fmt_diff(d)}) csv={csv}")
+        log.append(f"d: {d} ({_fmt_diff(d)}) csv={csv}")
         blocks_until_valid = csv - best.coin["confirmations"]
         if blocks_until_valid <= 0:
-            print(f"valid now")
+            log.append("valid now")
         else:
             mins = blocks_until_valid * 10
-            print(f"valid in ~{blocks_until_valid} blocks (~{mins // 60}h{mins % 60:02d}m)")
-        print(f"txid: {claim_tx.hash}")
-        print(f"hex: {claim_tx.serialize().hex()}")
+            log.append(f"valid in ~{blocks_until_valid} blocks (~{mins // 60}h{mins % 60:02d}m)")
+        log.append(f"txid: {local_txid}")
+        log.append(f"hex: {tx_hex}")
+        return dict(ok=True, txid=local_txid, input_txid=input_txid, input_vout=input_vout,
+                    tx_hex=tx_hex, log=log)
+
+    log.append(f"args.address: {args.address}")
+    log.append(f"input: {input_txid}:{input_vout}")
+    log.append(f"payto.hex(): {payto.hex()}")
+    log.append(f"claim_tx.hash (local txid, pre-broadcast): {local_txid}")
+    log.append(f"claim_tx.serialize().hex(): {tx_hex}")
+
+    rpc_txid = sendtx(args, claim_tx)
+    log.append(f"sendrawtransaction returned txid: {rpc_txid}")
+
+    # Verify #1: decoderawtransaction on the exact submitted hex pays args.address.
+    decoded = json.loads(args.bcli("decoderawtransaction", tx_hex))
+    decoded_addrs = []
+    for vout in decoded["vout"]:
+        spk = vout["scriptPubKey"]
+        if "address" in spk:               # newer bitcoind: singular string
+            decoded_addrs.append(spk["address"])
+        decoded_addrs.extend(spk.get("addresses", []))  # older bitcoind: list
+    if args.address in decoded_addrs:
+        log.append(f"VERIFY decoderawtransaction: OK — {args.address} found in decoded vout addresses {decoded_addrs}")
     else:
-        sendtx(args, claim_tx)
-    return 0
+        log.append(f"VERIFY decoderawtransaction: MISMATCH — {args.address} NOT in decoded vout addresses {decoded_addrs}")
+
+    # Verify #2: getrawtransaction on the RPC-returned txid matches the exact hex submitted.
+    try:
+        fetched = json.loads(args.bcli("getrawtransaction", rpc_txid, "true"))
+        fetched_hex = fetched.get("hex", "")
+        if fetched_hex == tx_hex:
+            log.append(f"VERIFY getrawtransaction: OK — node's stored tx hex for {rpc_txid} matches submitted hex")
+        else:
+            log.append(f"VERIFY getrawtransaction: MISMATCH — node's stored hex differs from submitted hex")
+            log.append(f"  submitted hex: {tx_hex}")
+            log.append(f"  node hex:      {fetched_hex}")
+    except Exception as e:
+        log.append(f"VERIFY getrawtransaction: FAILED to fetch {rpc_txid}: {e}")
+
+    # Verify #3: locally computed txid vs RPC-returned txid.
+    if rpc_txid == local_txid:
+        log.append(f"VERIFY txid match: OK — local {local_txid} == RPC {rpc_txid}")
+    else:
+        log.append(f"VERIFY txid match: MISMATCH")
+        log.append(f"  local txid: {local_txid}")
+        log.append(f"  RPC txid:   {rpc_txid}")
+        log.append(f"  submitted hex: {tx_hex}")
+
+    return dict(ok=True, txid=rpc_txid, input_txid=input_txid, input_vout=input_vout,
+                tx_hex=tx_hex, log=log)
+
+def _wait_for_confirmation(args, relayed, wait_seconds):
+    """Poll for each relayed tx's input being spent; report winner vs. competitor per coin."""
+    if not relayed or wait_seconds <= 0:
+        return
+    print(f"\nWaiting up to {wait_seconds}s for on-chain confirmation ({len(relayed)} pending)...")
+    start_h = json.loads(args.bcli("getblockchaininfo"))["blocks"]
+    pending = {r["txid"]: r for r in relayed}
+    resolved = {}
+    deadline = time.monotonic() + wait_seconds
+    while pending and time.monotonic() < deadline:
+        for txid, r in list(pending.items()):
+            out = args.bcli("gettxout", txid, "0")
+            if out:
+                resolved[txid] = "WON"
+                print(f"  {txid}: CONFIRMED (won)")
+                del pending[txid]
+                continue
+            still_there = args.bcli("gettxout", r["input_txid"], str(r["input_vout"]))
+            if not still_there:
+                resolved[txid] = "input spent by someone"
+                print(f"  {txid}: input {r['input_txid']}:{r['input_vout']} spent (lost race, checking who...)")
+                del pending[txid]
+        if pending:
+            time.sleep(15)
+
+    if not pending and not any(v == "input spent by someone" for v in resolved.values()):
+        return
+
+    end_h = json.loads(args.bcli("getblockchaininfo"))["blocks"]
+    for txid, r in list(pending.items()):
+        print(f"  {txid}: TIMEOUT — still pending after {wait_seconds}s")
+    for txid, status in resolved.items():
+        if status != "input spent by someone":
+            continue
+        r = next(x for x in relayed if x["txid"] == txid)
+        found = False
+        for h in range(start_h, end_h + 1):
+            bh = args.bcli("getblockhash", str(h))
+            block = json.loads(args.bcli("getblock", bh, "2"))
+            for tx in block["tx"]:
+                for vin in tx.get("vin", []):
+                    if vin.get("txid") == r["input_txid"] and vin.get("vout") == r["input_vout"]:
+                        winner = tx["txid"]
+                        if winner == txid:
+                            print(f"  {txid}: WON at height {h}")
+                        else:
+                            print(f"  {txid}: LOST to {winner} at height {h}")
+                        found = True
+        if not found:
+            print(f"  {txid}: input spent but spender not found in scanned range")
 
 # --- Server (fake bitcoind for ckpool) ---
 
@@ -1613,6 +1802,9 @@ def main(argv):
     claim.add_argument("--max-difficulty", default=26, type=int, help="Maximum difficulty to attempt")
     claim.add_argument("--feerate", default=None, type=int, help="Feerate to use (sats/vb)")
     claim.add_argument("--future", default=0, type=int, help="Pretend N extra blocks confirmed (dry run: print tx, don't relay)")
+    claim.add_argument("--utxo", default=None, type=str, help="Pin a specific coin (txid:vout) instead of auto-selecting the best one; for running parallel claims against distinct coins")
+    claim.add_argument("--parallel", default=1, type=int, help="Race N distinct coins concurrently (mitigates losing to competing claimants); mutually exclusive with --utxo")
+    claim.add_argument("--wait-confirm", default=900, type=int, dest="wait_confirm", help="After a --parallel run, poll up to N seconds for on-chain confirmation and report winners/losers (0 to skip)")
     claim.add_argument("address", help="Address to receive funds")
 
     info = cmds.add_parser("info", help="Show known faucet addresses and parameters")

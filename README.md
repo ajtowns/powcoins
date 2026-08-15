@@ -97,3 +97,24 @@ Because `bitcoin-util grind` is a CPU miner, the `--max-difficulty` figure is
 provided to avoid wasting energy if the only available coins have high
 difficulty. Each increment of max-diff (eg changing 30 to 31) will double
 the amount of (expected) work it takes to obtain a coin.
+
+### Racing multiple coins
+
+The faucet is often actively contested: a single sequential claim attempt
+can lose to a competing claimant who solves and broadcasts for the same
+coin first, even after your own proof-of-work succeeds. `--parallel=N`
+selects N distinct available coins and grinds/relays them concurrently
+instead of one at a time, so losing one race doesn't cost you the time to
+attempt another:
+
+```
+$ ./powcoins claim --relay-peer=inquisition.bitcoin-signet.net --max-difficulty=30 --parallel=6 $ADDR
+```
+
+After relaying, it polls for up to `--wait-confirm` seconds (default 900;
+`0` to skip) and reports, per coin, whether it confirmed or lost to a
+competing spend (naming the winning txid).
+
+A specific coin can also be targeted directly with `--utxo=<txid>:<vout>`
+instead of auto-selecting; it's mutually exclusive with `--parallel`, which
+uses it internally to pin each concurrent attempt to a distinct coin.
