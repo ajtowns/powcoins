@@ -97,3 +97,34 @@ Because `bitcoin-util grind` is a CPU miner, the `--max-difficulty` figure is
 provided to avoid wasting energy if the only available coins have high
 difficulty. Each increment of max-diff (eg changing 30 to 31) will double
 the amount of (expected) work it takes to obtain a coin.
+
+### Racing multiple coins
+
+The faucet is often actively contested: a single sequential claim attempt
+can lose to a competing claimant who solves and broadcasts for the same
+coin first, even after your own proof-of-work succeeds. `--parallel=N`
+selects N distinct available coins and grinds/relays them concurrently
+instead of one at a time, so losing one race doesn't cost you the time to
+attempt another:
+
+```
+$ ./powcoins claim --relay-peer=inquisition.bitcoin-signet.net --max-difficulty=30 --parallel=6 $ADDR
+```
+
+After relaying, it keeps watching each coin — with no time limit by
+default — until it's actually decided, logging status as it goes and
+reporting, per coin, whether it confirmed or lost to a competing spend
+(naming the winning txid). Pass `--wait-confirm=<seconds>` to cap how long
+it watches instead of running indefinitely, or `--no-wait` to skip
+watching altogether and just relay.
+
+A specific coin can also be targeted directly with `--utxo=<txid>:<vout>`
+instead of auto-selecting; it's mutually exclusive with `--parallel`, which
+uses it internally to pin each concurrent attempt to a distinct coin.
+
+Note that spreading across more coins doesn't by itself make any single
+contested coin easier to win: when two claims target the same coin, the one
+paying the higher feerate generally wins the race. Use `--fee-bump=<percent>`
+to pay above the estimated (or explicit `--feerate`) rate, e.g.
+`--fee-bump=50` pays 1.5x, to outbid other claimants on coins you expect to
+be contested.
